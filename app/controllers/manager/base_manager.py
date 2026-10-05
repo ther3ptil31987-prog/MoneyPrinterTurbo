@@ -81,7 +81,7 @@ class TaskManager:
                     f"enqueue task: {func.__name__}, current_tasks: {self.current_tasks}, "
                     f"queue_size: {queue_size}"
                 )
-                self.enqueue({"func": func, "args": args, "kwargs": kwargs})
+                self.enqueue_new_task({"func": func, "args": args, "kwargs": kwargs})
 
     def execute_task(self, func: Callable, *args: Any, **kwargs: Any):
         thread = threading.Thread(
@@ -97,37 +97,44 @@ class TaskManager:
 
     def check_queue(self):
         with self.lock:
-            if (
-                self.current_tasks < self.max_concurrent_tasks
-                and not self.is_queue_empty()
-            ):
-                task_info = self.dequeue()
-                if task_info is None:
-                    # dequeue() may skip and discard queue entries that no longer
-                    # pass current validation (see RedisTaskManager.dequeue) and
-                    # return None once nothing usable is left, even though
-                    # is_queue_empty() was False a moment earlier.
-                    return
-                func = task_info["func"]
-                args = task_info.get("args", ())
-                kwargs = task_info.get("kwargs", {})
-                # 与直接创建任务保持同一计数时机，避免刚出队的任务尚未在线程
-                # 内计数时，又有新请求绕过队列占用同一个并发名额。
-                self.current_tasks += 1
-                try:
-                    self.execute_task(func, *args, **kwargs)
-                except Exception:
-                    self.current_tasks -= 1
-                    self.enqueue(task_info)
-                    raise
+            self._check_queue_locked()
+
+    def _check_queue_locked(self):
+        """Dispatch one queued task while the caller holds ``self.lock``."""
+        if (
+            self.current_tasks < self.max_concurrent_tasks
+            and not self.is_queue_empty()
+        ):
+            task_info = self.dequeue()
+            if task_info is None:
+                # dequeue() may skip and discard queue entries that no longer
+                # pass current validation (see RedisTaskManager.dequeue) and
+                # return None once nothing usable is left, even though
+                # is_queue_empty() was False a moment earlier.
+                return
+            func = task_info["func"]
+            args = task_info.get("args", ())
+            kwargs = task_info.get("kwargs", {})
+            # Reserve the freed slot before another add_task can claim it.
+            self.current_tasks += 1
+            try:
+                self.execute_task(func, *args, **kwargs)
+            except Exception:
+                self.current_tasks -= 1
+                self.enqueue(task_info)
+                raise
 
     def task_done(self):
         with self.lock:
             self.current_tasks -= 1
-        self.check_queue()
+            self._check_queue_locked()
 
     def enqueue(self, task: Dict):
         raise NotImplementedError()
+
+    def enqueue_new_task(self, task: Dict):
+        """Admit new work; shared queues may need their own atomic limit check."""
+        self.enqueue(task)
 
     def dequeue(self):
         raise NotImplementedError()

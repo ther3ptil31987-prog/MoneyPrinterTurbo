@@ -1,11 +1,13 @@
 """Application implementation - ASGI."""
 
+import math
 import os
 from contextlib import asynccontextmanager
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -41,6 +43,14 @@ async def application_lifespan(_: FastAPI):
     from app.services import task as task_service
 
     task_service.recover_interrupted_cross_posts()
+
+    # Redis queue entries persist across API restarts. No task_done callback
+    # exists in the new process to dispatch them, so fill its worker slots now.
+    from app.controllers.manager.redis_manager import RedisTaskManager
+    from app.controllers.v1 import video as video_controller
+
+    if isinstance(video_controller.task_manager, RedisTaskManager):
+        video_controller.task_manager.resume_queued_tasks()
     try:
         yield
     finally:
@@ -55,10 +65,19 @@ def exception_handler(request: Request, e: HttpException):
 
 
 def validation_exception_handler(request: Request, e: RequestValidationError):
+    # Rejected inputs can contain NaN/Infinity, and custom validators attach
+    # exception objects to ctx. Neither can be emitted by JSONResponse directly.
+    errors = jsonable_encoder(
+        e.errors(),
+        custom_encoder={
+            float: lambda value: value if math.isfinite(value) else str(value),
+            Exception: str,
+        },
+    )
     return JSONResponse(
         status_code=400,
         content=utils.get_response(
-            status=400, data=e.errors(), message="field required"
+            status=400, data=errors, message="field required"
         ),
     )
 

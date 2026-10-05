@@ -1,15 +1,18 @@
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
+from loguru import logger
 from moviepy import (
     ImageClip,
     VideoFileClip,
@@ -21,9 +24,32 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from app.config import config
 from app.models.schema import MaterialInfo
 from app.services import video as vd
-from app.utils import utils
+from app.utils import logging_utils, utils
 
 resources_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "resources")
+
+
+@contextmanager
+def _capture_task_scoped_logs():
+    """
+    按 WebUI 任务日志的同一条规则收集日志：只保留归属当前线程的记录。
+
+    直接 patch ``logger.info`` 无法区分日志来自哪个线程，而 WebUI 丢日志的
+    原因正是线程归属，所以这里用真实的 loguru sink 加作用域过滤来验证。
+    """
+    messages = []
+    root_thread_id = threading.get_ident()
+    handler_id = logger.add(
+        lambda message: messages.append(message.record["message"]),
+        level="DEBUG",
+        filter=lambda record: (
+            logging_utils.log_scope_thread_id(record["thread"].id) == root_thread_id
+        ),
+    )
+    try:
+        yield messages
+    finally:
+        logger.remove(handler_id)
 
 
 class _FakeMoviePyClip:
@@ -63,6 +89,56 @@ class TestVideoService(unittest.TestCase):
         config.app.update(self.original_app_config)
         vd._runtime_disabled_video_codecs.clear()
         vd._ffmpeg_encoder_exists.cache_clear()
+
+    def test_clip_processing_concurrency_defaults_to_serial(self):
+        """未配置或配置无效时保持串行，显式设置仍可在安全范围内生效。"""
+        with patch.dict(config.app, {}, clear=True):
+            self.assertEqual(vd._get_clip_processing_concurrency(), 1)
+        for value, expected in (("bad", 1), (0, 1), (4, 4), (99, 8)):
+            with self.subTest(value=value):
+                with patch.dict(config.app, {"video_clip_concurrency": value}):
+                    self.assertEqual(vd._get_clip_processing_concurrency(), expected)
+
+    def test_generate_video_rejects_font_outside_directory_before_opening_media(self):
+        """WebUI、CLI 或内部调用绕过 API 时，渲染层也必须阻断越界字体。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            font_dir = Path(temp_dir, "fonts")
+            font_dir.mkdir()
+            outside = Path(temp_dir, "outside.ttf")
+            outside.write_bytes(b"not a font")
+
+            for font_name in (str(outside), "../outside.ttf"):
+                with (
+                    self.subTest(font_name=font_name),
+                    patch.object(vd.utils, "font_dir", return_value=str(font_dir)),
+                    patch.object(vd, "_open_video_clip_quietly") as open_video,
+                ):
+                    params = vd.VideoParams(video_subject="Coffee", font_name=font_name)
+                    with self.assertRaisesRegex(ValueError, "outside the allowed directory"):
+                        vd.generate_video(
+                            video_path="unused.mp4",
+                            audio_path="unused.mp3",
+                            subtitle_path="unused.srt",
+                            output_file="unused-output.mp4",
+                            params=params,
+                        )
+                    open_video.assert_not_called()
+
+    def test_generate_video_accepts_bundled_font_before_opening_media(self):
+        """内置字体必须继续通过校验，不能阻断默认字幕生成链路。"""
+        params = vd.VideoParams(video_subject="Coffee", font_name="STHeitiMedium.ttc")
+        with patch.object(
+            vd, "_open_video_clip_quietly", side_effect=RuntimeError("media reached")
+        ) as open_video:
+            with self.assertRaisesRegex(RuntimeError, "media reached"):
+                vd.generate_video(
+                    video_path="unused.mp4",
+                    audio_path="unused.mp3",
+                    subtitle_path="unused.srt",
+                    output_file="unused-output.mp4",
+                    params=params,
+                )
+        open_video.assert_called_once_with("unused.mp4")
 
     def test_subtitle_spring_animation_keeps_color_and_mask_aligned(self):
         """
@@ -208,6 +284,38 @@ class TestVideoService(unittest.TestCase):
         self.assertIn("protected-temp-clip.mp4", message)
         self.assertIn("permission denied", message)
 
+    def test_generate_video_ignores_existing_subtitle_when_disabled(self):
+        params = vd.VideoParams(
+            video_subject="test", subtitle_enabled=False, bgm_type=""
+        )
+        source_video = _FakeMoviePyClip()
+        voice_source = _FakeMoviePyClip()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            stale_subtitle = Path(tmp_dir) / "stale.srt"
+            stale_subtitle.write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\nOld caption\n\n", encoding="utf-8"
+            )
+            with (
+                patch.object(vd, "_open_video_clip_quietly", return_value=source_video),
+                patch.object(vd, "AudioFileClip", return_value=voice_source),
+                patch.object(vd, "SubtitlesClip", side_effect=AssertionError(
+                    "disabled subtitles must not be parsed"
+                )) as subtitle_loader,
+                patch.object(vd, "TextClip") as text_renderer,
+                patch.object(vd, "_write_videofile_with_codec_fallback") as writer,
+                patch.object(vd, "_get_configured_video_codec", return_value="libx264"),
+            ):
+                result = vd.generate_video(
+                    video_path="combined.mp4", audio_path="voice.mp3",
+                    subtitle_path=str(stale_subtitle), output_file="final.mp4", params=params,
+                )
+        self.assertTrue(result)
+        subtitle_loader.assert_not_called()
+        text_renderer.assert_not_called()
+        writer.assert_called_once()
+        self.assertEqual(source_video.close_calls, 2)
+        self.assertEqual(voice_source.close_calls, 1)
+
     def test_generate_video_reports_successful_bgm_mix_and_closes_sources(self):
         """BGM 混合成功后应返回 True，并释放所有原始文件 reader。"""
         params = vd.VideoParams(
@@ -244,6 +352,7 @@ class TestVideoService(unittest.TestCase):
 
         self.assertTrue(result)
         writer.assert_called_once()
+        self.assertTrue(writer.call_args.kwargs["atomic_output"])
         self.assertEqual(writer.call_args.kwargs["audio_fps"], 48000)
         self.assertEqual(source_video.close_calls, 1)
         self.assertEqual(voice_source.close_calls, 1)
@@ -446,6 +555,89 @@ class TestVideoService(unittest.TestCase):
             if os.path.exists(safe_img_path):
                 os.remove(safe_img_path)
 
+    def test_image_zoom_renders_keep_distinct_clip_durations(self):
+        """Two tasks must not overwrite one image render with another duration."""
+        class FakeImageClip:
+            def __init__(self, _path):
+                self.duration = 0
+
+            def with_duration(self, duration):
+                self.duration = duration
+                return self
+
+            def with_position(self, _position):
+                return self
+
+            def resized(self, _scale):
+                return self
+
+        class FakeCompositeClip:
+            def __init__(self, clips):
+                self.duration = clips[0].duration
+
+            def write_videofile(self, output, **_kwargs):
+                Path(output).write_bytes(f"duration={self.duration}".encode())
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = os.path.join(temp_dir, "image.png")
+            with (
+                patch.object(vd, "ImageClip", FakeImageClip),
+                patch.object(vd, "CompositeVideoClip", FakeCompositeClip),
+            ):
+                first = vd.render_image_zoom_video(image_path, clip_duration=4)
+                second = vd.render_image_zoom_video(image_path, clip_duration=7)
+
+            self.assertNotEqual(first, second)
+            self.assertEqual(Path(first).read_bytes(), b"duration=4")
+            self.assertEqual(Path(second).read_bytes(), b"duration=7")
+
+    def test_failed_image_zoom_render_preserves_previous_complete_clip(self):
+        """A failed rerender must leave the last verified MP4 available."""
+        class FakeImageClip:
+            duration = 0
+
+            def __init__(self, _path):
+                pass
+
+            def with_duration(self, duration):
+                self.duration = duration
+                return self
+
+            def with_position(self, _position):
+                return self
+
+            def resized(self, _scale):
+                return self
+
+        writes = 0
+
+        class FakeCompositeClip:
+            def __init__(self, _clips):
+                pass
+
+            def write_videofile(self, output, **_kwargs):
+                nonlocal writes
+                writes += 1
+                Path(output).write_bytes(b"complete" if writes == 1 else b"partial")
+                if writes == 2:
+                    raise RuntimeError("render interrupted")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = os.path.join(temp_dir, "image.png")
+            with (
+                patch.object(vd, "ImageClip", FakeImageClip),
+                patch.object(vd, "CompositeVideoClip", FakeCompositeClip),
+            ):
+                output = vd.render_image_zoom_video(image_path, clip_duration=5)
+                with self.assertRaisesRegex(RuntimeError, "render interrupted"):
+                    vd.render_image_zoom_video(image_path, clip_duration=5)
+
+            self.assertEqual(Path(output).read_bytes(), b"complete")
+            self.assertEqual(
+                sorted(path.name for path in Path(temp_dir).iterdir()),
+                ["image.png.zoom-5.mp4"],
+            )
+
     def test_preprocess_video_rejects_material_outside_local_videos(self):
         """
         local 素材路径来自 API 参数，不能允许任意绝对路径进入 MoviePy。
@@ -610,6 +802,52 @@ class TestVideoService(unittest.TestCase):
 
         self.assertNotIn("h264_nvenc", vd._runtime_disabled_video_codecs)
 
+    def test_failed_final_encode_keeps_previous_video_and_removes_partial_file(self):
+        """A failed encode must not replace a downloadable final video with partial bytes."""
+
+        class FailingClip:
+            def write_videofile(self, output_file, codec, **_kwargs):
+                Path(output_file).write_bytes(b"partial mp4")
+                raise RuntimeError("encoder stopped")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            final_path = Path(temp_dir, "final-1.mp4")
+            final_path.write_bytes(b"previous complete mp4")
+
+            with self.assertRaisesRegex(RuntimeError, "encoder stopped"):
+                vd._write_videofile_with_codec_fallback(
+                    FailingClip(),
+                    str(final_path),
+                    codec="libx264",
+                    atomic_output=True,
+                )
+
+            self.assertEqual(final_path.read_bytes(), b"previous complete mp4")
+            self.assertEqual(list(Path(temp_dir).iterdir()), [final_path])
+
+    def test_final_encode_publishes_only_after_writer_returns(self):
+        """Readers keep the old final video until the new encode completes."""
+        test = self
+
+        class SuccessfulClip:
+            def write_videofile(self, output_file, codec, **_kwargs):
+                test.assertNotEqual(Path(output_file), final_path)
+                test.assertEqual(final_path.read_bytes(), b"previous complete mp4")
+                Path(output_file).write_bytes(b"new complete mp4")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            final_path = Path(temp_dir, "final-1.mp4")
+            final_path.write_bytes(b"previous complete mp4")
+            vd._write_videofile_with_codec_fallback(
+                SuccessfulClip(),
+                str(final_path),
+                codec="libx264",
+                atomic_output=True,
+            )
+
+            self.assertEqual(final_path.read_bytes(), b"new complete mp4")
+            self.assertEqual(list(Path(temp_dir).iterdir()), [final_path])
+
     def test_format_ffmpeg_concat_path_normalizes_windows_path(self):
         """
         concat demuxer 的文件列表对 Windows 反斜杠较敏感，写入 list 前统一
@@ -643,6 +881,7 @@ class TestVideoService(unittest.TestCase):
                     stdout="",
                     stderr="nvenc device not available",
                 )
+            Path(command[-1]).write_bytes(b"encoded-video")
             return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -961,10 +1200,174 @@ class TestVideoService(unittest.TestCase):
         self.assertEqual(write_mock.call_count, 4)
         self.assertEqual(concat_mock.call_args.kwargs["max_duration"], 10.0)
 
+    def test_combine_videos_cleans_temp_clips_when_concat_fails(self):
+        """A failed final merge must not strand encoded clips on disk."""
+
+        class FakeAudioClip:
+            duration = 1.0
+
+        class FakeVideoClip:
+            duration = 2.0
+            size = (1080, 1920)
+            w = 1080
+            h = 1920
+
+            def subclipped(self, _start, _end):
+                return self
+
+        def write_clip(_clip, output_file, **_kwargs):
+            Path(output_file).write_bytes(b"encoded clip")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_file = os.path.join(temp_dir, "combined.mp4")
+            with (
+                patch.object(vd, "AudioFileClip", return_value=FakeAudioClip()),
+                patch.object(vd, "_open_video_clip_quietly", return_value=FakeVideoClip()),
+                patch.object(
+                    vd, "_write_videofile_with_codec_fallback", side_effect=write_clip
+                ),
+                patch.object(
+                    vd,
+                    "concat_video_clips_with_ffmpeg",
+                    side_effect=RuntimeError("concat failed"),
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "concat failed"):
+                    vd.combine_videos(
+                        combined_video_path=output_file,
+                        video_paths=["clip.mp4"],
+                        audio_file="audio.mp3",
+                        video_concat_mode=vd.VideoConcatMode.sequential,
+                    )
+
+            self.assertFalse(list(Path(temp_dir).glob("temp-clip-*.mp4")))
+
+    def test_combine_videos_cleans_failed_encoded_clip_and_reader(self):
+        """A bad source must not strand a partial MP4 or an FFmpeg reader."""
+
+        class FakeAudioClip:
+            duration = 0.5
+
+            def close(self):
+                pass
+
+        class FakeVideoClip:
+            duration = 1.0
+            size = (1080, 1920)
+            w = 1080
+            h = 1920
+
+            def __init__(self, source):
+                self.source = source
+                self.close_calls = 0
+                self.reader = self
+
+            def subclipped(self, _start, _end):
+                derived = FakeVideoClip(self.source)
+                derived_clips.append(derived)
+                return derived
+
+            def close(self):
+                self.close_calls += 1
+
+        derived_clips = []
+
+        def open_clip(source):
+            return FakeVideoClip(source)
+
+        def write_clip(clip, output_file, **_kwargs):
+            Path(output_file).write_bytes(b"partial")
+            if clip.source == "bad.mp4":
+                raise RuntimeError("encode failed")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(vd, "AudioFileClip", return_value=FakeAudioClip()),
+                patch.object(vd, "_open_video_clip_quietly", side_effect=open_clip),
+                patch.object(
+                    vd, "_write_videofile_with_codec_fallback", side_effect=write_clip
+                ),
+                patch.object(vd, "concat_video_clips_with_ffmpeg") as concat,
+            ):
+                vd.combine_videos(
+                    combined_video_path=os.path.join(temp_dir, "combined.mp4"),
+                    video_paths=["bad.mp4", "good.mp4"],
+                    audio_file="audio.mp3",
+                    video_concat_mode=vd.VideoConcatMode.sequential,
+                )
+
+            concat.assert_called_once()
+            self.assertEqual(derived_clips[0].close_calls, 1)
+            self.assertFalse(list(Path(temp_dir).glob("temp-clip-*.mp4")))
+
+    def test_combine_videos_skips_unreadable_source_when_good_clip_remains(self):
+        """A stale corrupt cache clip must not discard healthy downloaded footage."""
+        class FakeAudioClip:
+            duration = 0.5
+
+        class FakeVideoClip:
+            duration = 1.0
+            size = (1080, 1920)
+            w = 1080
+            h = 1920
+
+            def subclipped(self, _start, _end):
+                return self
+
+        def open_clip(source):
+            if source == "corrupt.mp4":
+                raise OSError("FFmpeg could not read video metadata")
+            return FakeVideoClip()
+
+        used_sources = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(vd, "AudioFileClip", return_value=FakeAudioClip()),
+                patch.object(vd, "_open_video_clip_quietly", side_effect=open_clip),
+                patch.object(vd, "_write_videofile_with_codec_fallback"),
+                patch.object(vd, "concat_video_clips_with_ffmpeg") as concat,
+                patch.object(vd, "delete_files"),
+            ):
+                vd.combine_videos(
+                    combined_video_path=os.path.join(temp_dir, "combined.mp4"),
+                    video_paths=["corrupt.mp4", "healthy.mp4"],
+                    audio_file="audio.mp3",
+                    video_concat_mode=vd.VideoConcatMode.sequential,
+                    used_video_paths=used_sources,
+                )
+
+        concat.assert_called_once()
+        self.assertEqual(used_sources, ["healthy.mp4"])
+
+    def test_combine_videos_reports_failure_if_every_source_is_unreadable(self):
+        """Never return an output path for an input set that yielded no clips."""
+        class FakeAudioClip:
+            duration = 1.0
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(vd, "AudioFileClip", return_value=FakeAudioClip()),
+                patch.object(
+                    vd,
+                    "_open_video_clip_quietly",
+                    side_effect=OSError("invalid cached video"),
+                ),
+                patch.object(vd, "concat_video_clips_with_ffmpeg") as concat,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "no readable video clips"):
+                    vd.combine_videos(
+                        combined_video_path=os.path.join(temp_dir, "combined.mp4"),
+                        video_paths=["corrupt.mp4"],
+                        audio_file="audio.mp3",
+                    )
+
+        concat.assert_not_called()
+
     def test_concat_video_clips_limits_output_to_audio_duration(self):
         """最终拼接时应裁到音频时长，避免安全余量带来明显静音尾巴。"""
 
         def fake_run(command, capture_output, text, check, **kwargs):
+            Path(command[-1]).write_bytes(b"encoded-video")
             return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -983,7 +1386,8 @@ class TestVideoService(unittest.TestCase):
 
         command = run.call_args.args[0]
         self.assertEqual(command[command.index("-t") + 1], "10.000")
-        self.assertLess(command.index("-t"), command.index(output_file))
+        self.assertLess(command.index("-t"), len(command) - 1)
+        self.assertNotEqual(command[-1], output_file)
 
     def test_concat_video_clips_logs_heartbeat_while_ffmpeg_runs(self):
         """
@@ -994,6 +1398,7 @@ class TestVideoService(unittest.TestCase):
         def slow_run(command, capture_output, text, check, **kwargs):
             # 模拟一次耗时拼接：这段窗口内心跳线程应至少记录一次存活日志。
             time.sleep(0.2)
+            Path(command[-1]).write_bytes(b"encoded-video")
             return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1019,6 +1424,314 @@ class TestVideoService(unittest.TestCase):
         ]
         self.assertTrue(heartbeats, "耗时拼接期间必须记录存活日志")
         self.assertRegex(heartbeats[0], r"elapsed=\d+s, output size: 0\.00 MB")
+
+    def test_concat_heartbeat_belongs_to_the_task_log_scope(self):
+        """
+        心跳由独立线程写出。WebUI 只收集任务线程作用域内的日志，心跳线程不
+        绑定作用域时，终端能看到存活信息，WebUI 面板却依旧一片空白。
+        """
+
+        def slow_run(command, capture_output, text, check, **kwargs):
+            time.sleep(0.2)
+            Path(command[-1]).write_bytes(b"encoded-video")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clip_file = os.path.join(temp_dir, "clip.mp4")
+            output_file = os.path.join(temp_dir, "combined.mp4")
+            Path(clip_file).write_bytes(b"fake")
+
+            with (
+                patch.object(vd, "_FFMPEG_CONCAT_HEARTBEAT_SECONDS", 0.02),
+                patch.object(vd.subprocess, "run", side_effect=slow_run),
+                _capture_task_scoped_logs() as messages,
+            ):
+                vd.concat_video_clips_with_ffmpeg(
+                    clip_files=[clip_file],
+                    output_file=output_file,
+                    threads=1,
+                    output_dir=temp_dir,
+                )
+
+        self.assertTrue(
+            [message for message in messages if "still running" in message],
+            "心跳日志必须归属发起拼接的任务线程",
+        )
+
+    def test_clip_processing_logs_belong_to_the_task_log_scope(self):
+        """
+        片段始终在 clip-process 线程池里处理，即使并发数为 1。逐片段日志是这一
+        阶段唯一的进度信息，必须归属任务线程，WebUI 才能显示“正在处理第几段”。
+        """
+
+        class _FakeAudioClip:
+            duration = 4.0
+
+            def close(self):
+                pass
+
+        class _FakeVideoClip:
+            def __init__(self, duration):
+                self.duration = duration
+                self.size = (1080, 1920)
+                self.w = 1080
+                self.h = 1920
+
+            def subclipped(self, start_time, end_time):
+                return _FakeVideoClip(end_time - start_time)
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(vd, "AudioFileClip", return_value=_FakeAudioClip()),
+                patch.object(
+                    vd,
+                    "_open_video_clip_quietly",
+                    side_effect=lambda _path: _FakeVideoClip(10.0),
+                ),
+                patch.object(vd, "_write_videofile_with_codec_fallback"),
+                patch.object(vd, "concat_video_clips_with_ffmpeg"),
+                patch.object(vd, "delete_files"),
+                _capture_task_scoped_logs() as messages,
+            ):
+                vd.combine_videos(
+                    combined_video_path=os.path.join(temp_dir, "combined.mp4"),
+                    video_paths=["clip.mp4"],
+                    audio_file="audio.mp3",
+                    video_concat_mode=vd.VideoConcatMode.sequential,
+                    max_clip_duration=2,
+                )
+
+        self.assertTrue(
+            [message for message in messages if message.startswith("processing clip")],
+            "逐片段处理日志必须归属发起合成的任务线程",
+        )
+
+    def test_combine_videos_reports_covered_duration_as_progress(self):
+        """
+        片段处理是合成阶段最耗时的部分（4K 素材每段约 20 秒），此前整个阶段
+        进度固定在 50%。每处理完一段都要报告已覆盖的成片时长比例，并写一条
+        带覆盖时长的日志；全部覆盖后比例封顶为 1.0。
+        """
+
+        class _FakeAudioClip:
+            duration = 4.0
+
+            def close(self):
+                pass
+
+        class _FakeVideoClip:
+            def __init__(self, duration):
+                self.duration = duration
+                self.size = (1080, 1920)
+                self.w = 1080
+                self.h = 1920
+
+            def subclipped(self, start_time, end_time):
+                return _FakeVideoClip(end_time - start_time)
+
+            def close(self):
+                pass
+
+        fractions = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(vd, "AudioFileClip", return_value=_FakeAudioClip()),
+                patch.object(
+                    vd,
+                    "_open_video_clip_quietly",
+                    side_effect=lambda _path: _FakeVideoClip(10.0),
+                ),
+                patch.object(vd, "_write_videofile_with_codec_fallback"),
+                patch.object(vd, "concat_video_clips_with_ffmpeg"),
+                patch.object(vd, "delete_files"),
+                patch.object(vd.logger, "info") as info,
+            ):
+                vd.combine_videos(
+                    combined_video_path=os.path.join(temp_dir, "combined.mp4"),
+                    # 顺序模式下每个源文件只取一段，三个源文件对应三段。
+                    video_paths=["a.mp4", "b.mp4", "c.mp4"],
+                    audio_file="audio.mp3",
+                    video_concat_mode=vd.VideoConcatMode.sequential,
+                    max_clip_duration=2,
+                    progress_callback=fractions.append,
+                )
+
+        # 配音 4.0 秒加 0.1 秒安全余量，每段 2 秒：需要 3 段才覆盖 4.1 秒。
+        self.assertEqual(len(fractions), 3)
+        self.assertEqual(fractions, sorted(fractions))
+        self.assertAlmostEqual(fractions[0], 2.0 / 4.1, places=3)
+        self.assertEqual(fractions[-1], 1.0)
+        processed = [
+            str(call.args[0])
+            for call in info.call_args_list
+            if str(call.args[0]).startswith("processed clip")
+        ]
+        self.assertEqual(
+            processed,
+            [
+                "processed clip 1: 2.0 of 4.1s covered",
+                "processed clip 2: 4.0 of 4.1s covered",
+                "processed clip 3: 6.0 of 4.1s covered",
+            ],
+        )
+
+    def test_failing_clip_progress_callback_does_not_break_combine(self):
+        """进度只是展示信息，回调出错不能让已经处理好的片段作废。"""
+
+        class _FakeAudioClip:
+            duration = 1.0
+
+            def close(self):
+                pass
+
+        class _FakeVideoClip:
+            def __init__(self, duration):
+                self.duration = duration
+                self.size = (1080, 1920)
+                self.w = 1080
+                self.h = 1920
+
+            def subclipped(self, start_time, end_time):
+                return _FakeVideoClip(end_time - start_time)
+
+            def close(self):
+                pass
+
+        def broken_callback(_fraction):
+            raise RuntimeError("state backend unavailable")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            combined_video_path = os.path.join(temp_dir, "combined.mp4")
+            with (
+                patch.object(vd, "AudioFileClip", return_value=_FakeAudioClip()),
+                patch.object(
+                    vd,
+                    "_open_video_clip_quietly",
+                    side_effect=lambda _path: _FakeVideoClip(10.0),
+                ),
+                patch.object(vd, "_write_videofile_with_codec_fallback"),
+                patch.object(vd, "concat_video_clips_with_ffmpeg") as concat,
+                patch.object(vd, "delete_files"),
+                patch.object(vd.logger, "warning") as warning,
+            ):
+                result = vd.combine_videos(
+                    combined_video_path=combined_video_path,
+                    video_paths=["clip.mp4"],
+                    audio_file="audio.mp3",
+                    video_concat_mode=vd.VideoConcatMode.sequential,
+                    max_clip_duration=2,
+                    progress_callback=broken_callback,
+                )
+
+        self.assertEqual(result, combined_video_path)
+        concat.assert_called_once()
+        self.assertTrue(
+            [
+                call
+                for call in warning.call_args_list
+                if "progress" in str(call.args[0])
+            ]
+        )
+
+    def test_stage_heartbeat_logs_while_running_and_stops_afterwards(self):
+        """
+        最终成片编码期间 MoviePy 不输出任何日志。心跳要在阶段运行时按间隔
+        写出、归属任务线程，并在阶段结束后停止，不能留下继续刷日志的线程。
+        """
+        with (
+            patch.object(vd, "_STAGE_HEARTBEAT_SECONDS", 0.02),
+            _capture_task_scoped_logs() as messages,
+        ):
+            with vd._stage_heartbeat("final video render"):
+                time.sleep(0.2)
+            heartbeats_at_exit = len(
+                [m for m in messages if "still running" in m]
+            )
+            time.sleep(0.1)
+            heartbeats_later = len([m for m in messages if "still running" in m])
+
+        self.assertGreater(heartbeats_at_exit, 0)
+        self.assertEqual(heartbeats_later, heartbeats_at_exit)
+        self.assertRegex(
+            next(m for m in messages if "still running" in m),
+            r"^final video render still running: elapsed=\d+s$",
+        )
+
+    def test_stage_heartbeat_stops_when_the_stage_fails(self):
+        """阶段抛出异常时心跳线程同样要停止，异常原样向外传播。"""
+        with patch.object(vd, "_STAGE_HEARTBEAT_SECONDS", 0.02):
+            with _capture_task_scoped_logs() as messages:
+                with self.assertRaisesRegex(RuntimeError, "encode failed"):
+                    with vd._stage_heartbeat("final video render"):
+                        raise RuntimeError("encode failed")
+                time.sleep(0.1)
+
+        self.assertEqual([m for m in messages if "still running" in m], [])
+
+    def test_generate_video_reports_heartbeat_during_final_render(self):
+        """最终编码耗时数分钟，期间必须有存活日志。"""
+        params = vd.VideoParams(
+            video_subject="test", subtitle_enabled=False, bgm_type=""
+        )
+
+        def slow_write(*_args, **_kwargs):
+            time.sleep(0.2)
+
+        with (
+            patch.object(vd, "_STAGE_HEARTBEAT_SECONDS", 0.02),
+            patch.object(
+                vd, "_open_video_clip_quietly", return_value=_FakeMoviePyClip()
+            ),
+            patch.object(vd, "AudioFileClip", return_value=_FakeMoviePyClip()),
+            patch.object(
+                vd, "_write_videofile_with_codec_fallback", side_effect=slow_write
+            ),
+            patch.object(vd, "_get_configured_video_codec", return_value="libx264"),
+            _capture_task_scoped_logs() as messages,
+        ):
+            vd.generate_video(
+                video_path="combined.mp4",
+                audio_path="voice.mp3",
+                subtitle_path="",
+                output_file="final.mp4",
+                params=params,
+            )
+
+        self.assertTrue(
+            [m for m in messages if m.startswith("final video render still running")]
+        )
+
+    def test_concat_timeout_fails_without_retrying_another_codec(self):
+        """A stalled FFmpeg must fail the task and release the concat list file."""
+        config.app["ffmpeg_concat_timeout_seconds"] = 12
+        config.app["video_codec"] = "h264_nvenc"
+
+        def timed_out_run(command, **kwargs):
+            self.assertEqual(kwargs["timeout"], 12)
+            raise subprocess.TimeoutExpired(
+                command, kwargs["timeout"], stderr=b"stalled"
+            )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clip_file = os.path.join(temp_dir, "clip.mp4")
+            output_file = os.path.join(temp_dir, "combined.mp4")
+            Path(clip_file).write_bytes(b"fake")
+
+            with patch.object(vd, "_ffmpeg_encoder_exists", return_value=True):
+                with patch.object(vd.subprocess, "run", side_effect=timed_out_run) as run:
+                    with self.assertRaisesRegex(TimeoutError, "12 seconds"):
+                        vd.concat_video_clips_with_ffmpeg(
+                            clip_files=[clip_file],
+                            output_file=output_file,
+                            threads=1,
+                            output_dir=temp_dir,
+                        )
+
+            self.assertEqual(run.call_count, 1)
+            self.assertFalse(Path(temp_dir, "ffmpeg-concat-list.txt").exists())
 
     def test_concat_video_clips_heartbeat_tolerates_missing_output_file(self):
         """

@@ -148,6 +148,11 @@ def _validate_image(file_path: str, extension: str) -> None:
                         "uploaded image content does not match its file extension"
                     )
                 image.verify()
+            # verify() checks structure but may accept truncated JPEG pixel data.
+            # Reopen after verify() (which invalidates the decoder) and decode
+            # every pixel before publishing the upload to later render tasks.
+            with Image.open(file_path) as image:
+                image.load()
     except MaterialUploadError:
         raise
     except (
@@ -190,10 +195,18 @@ def _validate_video(
                 "-v",
                 "error",
                 "-xerror",
+                # Uploaded files must be self-contained media, not playlists
+                # that cause validation/rendering to read adjacent files or URLs.
+                "-protocol_whitelist",
+                "file,pipe",
+                "-format_whitelist",
+                "mov,avi,flv,matroska",
                 "-i",
                 file_path,
                 "-map",
-                "0:v:0",
+                # Uppercase V excludes attached pictures/album covers. A cover
+                # in an audio container is not a renderable video material.
+                "0:V:0",
                 "-f",
                 "null",
                 "-",

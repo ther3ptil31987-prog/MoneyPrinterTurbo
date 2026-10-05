@@ -205,12 +205,12 @@ LLM_PROVIDER_REGISTRY = (
                 base_url="https://api.moonshot.cn/v1",
                 api_key_url=(
                     "https://platform.kimi.com?"
-                    "track_id=track-2f5441d6ffd84c509dd079d78e9db5dc&"
+                    "track_id=track-6eec1e56a4494e52adcaebbcbbefce59&"
                     "aff=moneyprinterturbo"
                 ),
                 model_docs_url=(
                     "https://platform.kimi.com/docs/models?"
-                    "track_id=track-2f5441d6ffd84c509dd079d78e9db5dc&"
+                    "track_id=track-6eec1e56a4494e52adcaebbcbbefce59&"
                     "aff=moneyprinterturbo"
                 ),
             ),
@@ -220,12 +220,12 @@ LLM_PROVIDER_REGISTRY = (
                 base_url="https://api.moonshot.ai/v1",
                 api_key_url=(
                     "https://platform.kimi.ai?"
-                    "track_id=track-f6b0a640d35c41deb03b247242a1058c&"
+                    "track_id=track-9e3b711aa2594e378f6fe5b8de718a76&"
                     "aff=moneyprinterturbo"
                 ),
                 model_docs_url=(
                     "https://platform.kimi.ai/docs/models?"
-                    "track_id=track-f6b0a640d35c41deb03b247242a1058c&"
+                    "track_id=track-9e3b711aa2594e378f6fe5b8de718a76&"
                     "aff=moneyprinterturbo"
                 ),
             ),
@@ -317,6 +317,17 @@ LLM_PROVIDER_REGISTRY = (
         ),
         default_model="mimo-v2.5-pro",
         default_base_url="https://api.xiaomimimo.com/v1",
+    ),
+    # 讯飞星辰 MaaS 的按量付费和 Token Plan 使用不同的 OpenAI 兼容地址，
+    # 两边的 API Key 不能混用。这里默认按量付费，Token Plan 用户在 Base URL
+    # 中改填 maas-token-api 的地址即可。
+    LLMProviderSpec(
+        "iflytek",
+        "iFlytek Spark (Astron MaaS)",
+        api_key_url="https://maas.xfyun.cn/",
+        default_model="spark-x2.5",
+        default_base_url="https://maas-api.cn-huabei-1.xf-yun.com/v2",
+        model_docs_url="https://maas.xfyun.cn/modelSquare",
     ),
     # 聚合与统一接入平台
     LLMProviderSpec(
@@ -411,6 +422,38 @@ LLM_PROVIDER_REGISTRY = (
         default_model="gpt-5.5",
         default_base_url="https://fluxionai.space/v1",
         model_docs_url="https://fluxionai.space/model-plaza",
+    ),
+    LLMProviderSpec(
+        "cheaperinference",
+        "Cheaper Inference",
+        api_key_url="https://cheaperinference.com/signup",
+        default_model="gpt-5.4-mini",
+        default_base_url="https://api.cheaperinference.com/v1",
+        model_docs_url="https://cheaperinference.com/#models",
+    ),
+    LLMProviderSpec(
+        "requesty",
+        "Requesty",
+        api_key_url="https://app.requesty.ai/api-keys",
+        default_model="openai/gpt-5.4-mini",
+        default_base_url="https://router.requesty.ai/v1",
+        model_docs_url="https://www.requesty.ai/models",
+    ),
+    LLMProviderSpec(
+        "futureinfra",
+        "FutureInfra",
+        api_key_url="https://futureinfra.ai/console/?screen=ai-router",
+        default_model="openai/gpt-4o-mini",
+        default_base_url="https://futureinfra.ai/v1/ai",
+        model_docs_url="https://futureinfra.ai/ai/",
+    ),
+    LLMProviderSpec(
+        "yapi",
+        "Y-API",
+        api_key_url="https://y-api.bestvirtualgoods.com/app/keys",
+        default_model="deepseek/deepseek-v4-flash",
+        default_base_url="https://api.y-api.bestvirtualgoods.com/v1",
+        model_docs_url="https://y-api.bestvirtualgoods.com/models",
     ),
     # 本地部署与通用网关
     LLMProviderSpec(

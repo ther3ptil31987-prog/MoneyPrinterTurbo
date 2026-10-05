@@ -1,13 +1,15 @@
-import glob
+import mimetypes
 import os
 import pathlib
 import shutil
 from typing import Union
+from urllib.parse import quote
 
 from fastapi import BackgroundTasks, Depends, Path, Query, Request, UploadFile
 from fastapi.params import File
 from fastapi.responses import FileResponse, StreamingResponse
 from loguru import logger
+from starlette.background import BackgroundTask
 
 from app.config import config
 from app.controllers import base
@@ -50,8 +52,14 @@ _max_queued_tasks = config.app.get("max_queued_tasks", 100)
 
 
 def _build_redis_url(host: str, port: int, db: int, password: str | None) -> str:
-    auth = f":{password}@" if password else ""
-    return f"redis://{auth}{host}:{port}/{db}"
+    # Passwords are URL userinfo. Escape reserved characters so Redis receives
+    # the exact configured secret rather than parsing part of it as a host,
+    # port, path, query, or fragment.
+    auth = f":{quote(password, safe='')}@" if password else ""
+    # URL authorities require brackets around IPv6 literals. RedisState also
+    # accepts a plain IPv6 host, so keep the queue client compatible with it.
+    url_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    return f"redis://{auth}{url_host}:{port}/{db}"
 
 
 redis_url = _build_redis_url(_redis_host, _redis_port, _redis_db, _redis_password)
@@ -122,11 +130,29 @@ def _task_file_to_uri(file: str, endpoint: str, task_dir: str, request_id: str) 
         )
         return file
 
-    relative_path = os.path.relpath(resolved_path, task_dir).replace("\\", "/")
-    uri_path = f"tasks/{relative_path}"
+    relative_path = os.path.relpath(
+        resolved_path, os.path.realpath(task_dir)
+    ).replace("\\", "/")
+    uri_path = f"tasks/{quote(relative_path, safe='/')}"
     if endpoint:
         return f"{endpoint.rstrip('/')}/{uri_path}"
     return f"/{uri_path}"
+
+
+def _task_response_data(task: dict, endpoint: str, task_dir: str, request_id: str) -> dict:
+    response_task = _public_task_data(task)
+    for key in ("videos", "combined_videos"):
+        if key in task:
+            response_task[key] = [
+                _task_file_to_uri(file, endpoint, task_dir, request_id)
+                for file in task[key]
+            ]
+    for key in ("audio_file", "subtitle_path"):
+        if task.get(key):
+            response_task[key] = _task_file_to_uri(
+                task[key], endpoint, task_dir, request_id
+            )
+    return response_task
 
 
 def _parse_byte_range(
@@ -207,6 +233,16 @@ def create_task(
     task_id = utils.get_uuid()
     request_id = base.get_task_id(request)
     try:
+        if (
+            stop_at == "video"
+            and isinstance(body, TaskVideoRequest)
+            and body.subtitle_enabled
+        ):
+            # 字体名可由 API 客户端直接提交，不能等到后台渲染时才发现路径越界。
+            # 这里与渲染层共用目录边界校验，让非法请求在创建付费任务前返回 400。
+            file_security.resolve_path_within_directory(
+                utils.font_dir(), body.font_name or "STHeitiMedium.ttc"
+            )
         task = {
             "task_id": task_id,
             "request_id": request_id,
@@ -241,12 +277,17 @@ def create_task(
 def get_all_tasks(
     request: Request,
     page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1),
+    page_size: int = Query(10, ge=1, le=1000),
 ):
     tasks, total = sm.state.get_all_tasks(page, page_size)
+    request_id = base.get_task_id(request)
+    endpoint = config.app.get("endpoint", "").rstrip("/")
+    task_dir = utils.task_dir()
 
     response = {
-        "tasks": [_public_task_data(task) for task in tasks],
+        "tasks": [
+            _task_response_data(task, endpoint, task_dir, request_id) for task in tasks
+        ],
         "total": total,
         "page": page,
         "page_size": page_size,
@@ -268,18 +309,7 @@ def get_task(
     task = sm.state.get_task(task_id)
     if task:
         task_dir = utils.task_dir()
-        response_task = _public_task_data(task)
-
-        if "videos" in task:
-            response_task["videos"] = [
-                _task_file_to_uri(v, endpoint, task_dir, request_id)
-                for v in task["videos"]
-            ]
-        if "combined_videos" in task:
-            response_task["combined_videos"] = [
-                _task_file_to_uri(v, endpoint, task_dir, request_id)
-                for v in task["combined_videos"]
-            ]
+        response_task = _task_response_data(task, endpoint, task_dir, request_id)
         return utils.get_response(200, response_task)
 
     raise HttpException(
@@ -311,7 +341,14 @@ def delete_video(request: Request, task_id: str = Path(..., description="Task ID
         tasks_dir = utils.task_dir()
         current_task_dir = os.path.join(tasks_dir, task_id)
         if os.path.exists(current_task_dir):
-            shutil.rmtree(current_task_dir)
+            try:
+                shutil.rmtree(current_task_dir)
+            except FileNotFoundError:
+                # Another completed-task deletion may remove this directory
+                # after our existence check. Only accept an absent root;
+                # partial deletion and other filesystem errors must keep state.
+                if os.path.lexists(current_task_dir):
+                    raise
 
         sm.state.delete_task(task_id)
         logger.success(f"video deleted: {utils.to_json(task)}")
@@ -329,10 +366,15 @@ def get_bgm_list(request: Request):
     bgm_list = []
     for file in bgm_service.list_bgm_files():
         filename = os.path.basename(file)
+        try:
+            size = os.path.getsize(file)
+        except OSError as exc:
+            logger.warning(f"skip unavailable background music: name={filename}, error={exc}")
+            continue
         bgm_list.append(
             {
                 "name": filename,
-                "size": os.path.getsize(file),
+                "size": size,
                 # 只返回文件名，避免把服务器绝对路径暴露给调用方。服务端会
                 # 在 storage/bgm 和 resource/songs 两个白名单目录中重新解析。
                 "file": filename,
@@ -389,29 +431,32 @@ def upload_bgm_file(request: Request, file: UploadFile = File(...)):
     "/video_materials", response_model=VideoMaterialRetrieveResponse, summary="Retrieve local video materials"
 )
 def get_video_materials_list(request: Request):
-    allowed_suffixes = tuple(
-        extension.removeprefix(".")
-        for extension in material_upload_service.SUPPORTED_MATERIAL_EXTENSIONS
-    )
+    allowed_suffixes = material_upload_service.SUPPORTED_MATERIAL_EXTENSIONS
     local_videos_dir = utils.storage_dir("local_videos", create=True)
-    files = []
-    for suffix in allowed_suffixes:
-        files.extend(glob.glob(os.path.join(local_videos_dir, f"*.{suffix}")))
-    # 文件系统枚举顺序不稳定，直接返回会导致“顺序拼接”在不同机器或不同
-    # 时刻表现不一致。这里统一按文件名排序，至少保证服务端返回顺序可预测。
-    files.sort(key=lambda file_path: os.path.basename(file_path).lower())
     video_materials_list = []
-    for file in files:
-        filename = os.path.basename(file)
-        video_materials_list.append(
-            {
-                "name": filename,
-                "size": os.path.getsize(file),
-                # 与 BGM 一样，只返回文件名；创建任务时再在 local_videos
-                # 白名单目录内解析，避免 API 泄露宿主机绝对路径。
-                "file": filename,
-            }
-        )
+    with os.scandir(local_videos_dir) as entries:
+        for entry in entries:
+            if (
+                entry.name.startswith(".")
+                or pathlib.Path(entry.name).suffix.lower() not in allowed_suffixes
+            ):
+                continue
+            try:
+                # Do not follow links outside local_videos or list an upload
+                # that disappeared while the directory was being scanned.
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                size = entry.stat(follow_symlinks=False).st_size
+            except OSError as exc:
+                logger.warning(
+                    f"skip unavailable local material: name={entry.name}, error={exc}"
+                )
+                continue
+            video_materials_list.append(
+                {"name": entry.name, "size": size, "file": entry.name}
+            )
+    # Keep ordered material selection stable across file systems and runs.
+    video_materials_list.sort(key=lambda item: (item["name"].casefold(), item["name"]))
     response = {"files": video_materials_list}
     return utils.get_response(200, response)
 
@@ -460,29 +505,48 @@ async def stream_video(request: Request, file_path: str):
     tasks_dir = utils.task_dir()
     video_path = _resolve_path_within_directory(tasks_dir, file_path, request_id)
     range_header = request.headers.get("Range")
-    video_size = os.path.getsize(video_path)
-    start, end = _parse_byte_range(range_header, video_size, request_id)
+    # The body is produced after this handler returns. Open now so a task
+    # deletion or replacement between headers and iteration cannot make the
+    # stream fail or mismatch the size used for Content-Range.
+    try:
+        video_file = open(video_path, "rb")
+    except FileNotFoundError as exc:
+        raise HttpException(
+            task_id=request_id,
+            status_code=404,
+            message=f"{request_id}: file no longer exists",
+        ) from exc
+    try:
+        video_size = os.fstat(video_file.fileno()).st_size
+        start, end = _parse_byte_range(range_header, video_size, request_id)
+    except Exception:
+        video_file.close()
+        raise
     length = end - start + 1
 
-    def file_iterator(file_path, offset=0, bytes_to_read=None):
-        with open(file_path, "rb") as f:
-            f.seek(offset, os.SEEK_SET)
-            remaining = bytes_to_read or video_size
+    def file_iterator():
+        try:
+            video_file.seek(start, os.SEEK_SET)
+            remaining = length
             while remaining > 0:
-                bytes_to_read = min(4096, remaining)
-                data = f.read(bytes_to_read)
+                data = video_file.read(min(4096, remaining))
                 if not data:
                     break
                 remaining -= len(data)
                 yield data
+        finally:
+            video_file.close()
 
     response = StreamingResponse(
-        file_iterator(video_path, start, length), media_type="video/mp4"
+        file_iterator(),
+        media_type="video/mp4",
+        background=BackgroundTask(video_file.close),
     )
-    response.headers["Content-Range"] = f"bytes {start}-{end}/{video_size}"
     response.headers["Accept-Ranges"] = "bytes"
     response.headers["Content-Length"] = str(length)
-    response.status_code = 206  # Partial Content
+    if range_header:
+        response.headers["Content-Range"] = f"bytes {start}-{end}/{video_size}"
+        response.status_code = 206  # Partial Content
 
     return response
 
@@ -500,9 +564,9 @@ async def download_video(request: Request, file_path: str):
     video_path = _resolve_path_within_directory(tasks_dir, file_path, request_id)
     file_path = pathlib.Path(video_path)
     filename = file_path.name
-    extension = file_path.suffix
+    media_type, _ = mimetypes.guess_type(filename)
     return FileResponse(
         path=video_path,
         filename=filename,
-        media_type=f"video/{extension[1:]}",
+        media_type=media_type or "application/octet-stream",
     )

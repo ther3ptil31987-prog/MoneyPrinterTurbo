@@ -5,8 +5,10 @@ import tempfile
 import tomllib
 import types
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from threading import Barrier
 from unittest.mock import patch
 
 from pydantic import ValidationError
@@ -155,6 +157,37 @@ class TestScriptPromptOptions(unittest.TestCase):
         self.assertIs(captured["app_config"], app_config)
         self.assertEqual(captured["app_config"]["openai_api_key"], "snapshot-key")
 
+    def test_generate_script_retries_provider_error_instead_of_using_it_as_narration(self):
+        with patch.object(
+            llm,
+            "_generate_response",
+            side_effect=["Error: temporary provider failure", "Real narration."],
+        ) as generate_response:
+            result = llm.generate_script(video_subject="Coffee")
+
+        self.assertEqual(result, "Real narration.")
+        self.assertEqual(generate_response.call_count, 2)
+
+    def test_generate_script_returns_empty_when_provider_always_fails(self):
+        with patch.object(
+            llm, "_generate_response", return_value="Error: invalid API key"
+        ):
+            result = llm.generate_script(video_subject="Coffee")
+
+        self.assertEqual(result, "")
+
+    def test_generate_script_does_not_return_stale_quota_error_after_retries(self):
+        responses = ["当日额度已消耗完"] + [
+            RuntimeError("provider unavailable")
+        ] * (llm._max_retries - 1)
+        with patch.object(
+            llm, "_generate_response", side_effect=responses
+        ) as generate_response:
+            result = llm.generate_script(video_subject="Coffee")
+
+        self.assertEqual(result, "")
+        self.assertEqual(generate_response.call_count, llm._max_retries)
+
     def test_generate_script_strips_each_bracket_group_independently(self):
         """
         format_response must remove each [bracket] and (paren) group in
@@ -233,6 +266,24 @@ class TestScriptPromptOptions(unittest.TestCase):
 
         self.assertEqual(result, [])
         self.assertIsInstance(result, list)
+
+    def test_generate_terms_retries_non_string_items_in_recovered_json(self):
+        """The prose-wrapped JSON recovery path must enforce List[str] too."""
+        with patch.object(
+            llm,
+            "_generate_response",
+            side_effect=[
+                'Search terms: [123, {"query": "coffee"}]',
+                'Search terms: ["coffee beans", "barista tools"]',
+            ],
+        ) as generate_response:
+            result = llm.generate_terms(
+                video_subject="Coffee",
+                video_script="How to brew coffee.",
+            )
+
+        self.assertEqual(result, ["coffee beans", "barista tools"])
+        self.assertEqual(generate_response.call_count, 2)
 
     def test_video_script_request_rejects_invalid_advanced_options(self):
         """
@@ -320,6 +371,59 @@ class TestLiteLLMProvider(unittest.TestCase):
         self.assertEqual(api_route.default_base_url, "https://www.api-route.com/v1")
         self.assertEqual(api_route.adapter, "openai_compatible")
         self.assertTrue(api_route.requires_api_key)
+        cheaperinference = get_llm_provider("cheaperinference")
+        self.assertEqual(cheaperinference.default_model, "gpt-5.4-mini")
+        self.assertEqual(
+            cheaperinference.default_base_url,
+            "https://api.cheaperinference.com/v1",
+        )
+        self.assertEqual(cheaperinference.adapter, "openai_compatible")
+        self.assertTrue(cheaperinference.requires_api_key)
+        self.assertEqual(
+            cheaperinference.api_key_url,
+            "https://cheaperinference.com/signup",
+        )
+        self.assertEqual(
+            cheaperinference.model_docs_url,
+            "https://cheaperinference.com/#models",
+        )
+        requesty = get_llm_provider("requesty")
+        self.assertEqual(requesty.default_model, "openai/gpt-5.4-mini")
+        self.assertEqual(requesty.default_base_url, "https://router.requesty.ai/v1")
+        self.assertEqual(requesty.adapter, "openai_compatible")
+        self.assertTrue(requesty.requires_api_key)
+        self.assertEqual(requesty.api_key_url, "https://app.requesty.ai/api-keys")
+        self.assertEqual(requesty.model_docs_url, "https://www.requesty.ai/models")
+        futureinfra = get_llm_provider("futureinfra")
+        self.assertEqual(futureinfra.default_model, "openai/gpt-4o-mini")
+        self.assertEqual(futureinfra.default_base_url, "https://futureinfra.ai/v1/ai")
+        self.assertEqual(futureinfra.adapter, "openai_compatible")
+        self.assertTrue(futureinfra.requires_api_key)
+        self.assertEqual(
+            futureinfra.api_key_url,
+            "https://futureinfra.ai/console/?screen=ai-router",
+        )
+        self.assertEqual(futureinfra.model_docs_url, "https://futureinfra.ai/ai/")
+        yapi = get_llm_provider("yapi")
+        self.assertEqual(yapi.default_model, "deepseek/deepseek-v4-flash")
+        self.assertEqual(yapi.default_base_url, "https://api.y-api.bestvirtualgoods.com/v1")
+        self.assertEqual(yapi.adapter, "openai_compatible")
+        self.assertTrue(yapi.requires_api_key)
+        self.assertEqual(
+            yapi.api_key_url,
+            "https://y-api.bestvirtualgoods.com/app/keys",
+        )
+        self.assertEqual(yapi.model_docs_url, "https://y-api.bestvirtualgoods.com/models")
+        iflytek = get_llm_provider("iflytek")
+        self.assertEqual(iflytek.default_model, "spark-x2.5")
+        self.assertEqual(
+            iflytek.default_base_url,
+            "https://maas-api.cn-huabei-1.xf-yun.com/v2",
+        )
+        self.assertEqual(iflytek.adapter, "openai_compatible")
+        self.assertTrue(iflytek.requires_api_key)
+        self.assertEqual(iflytek.api_key_url, "https://maas.xfyun.cn/")
+        self.assertEqual(iflytek.model_docs_url, "https://maas.xfyun.cn/modelSquare")
         pollinations = get_llm_provider("pollinations")
         self.assertEqual(pollinations.default_model, "openai-fast")
         self.assertEqual(
@@ -368,6 +472,7 @@ class TestLiteLLMProvider(unittest.TestCase):
                 "grok",
                 "minimax",
                 "mimo",
+                "iflytek",
                 "shengsuanyun",
                 "apimart",
                 "cloudflare",
@@ -378,6 +483,10 @@ class TestLiteLLMProvider(unittest.TestCase):
                 "openrouter",
                 "api_route",
                 "fluxionai",
+                "cheaperinference",
+                "requesty",
+                "futureinfra",
+                "yapi",
                 "ollama",
                 "claude_code",
                 "oneapi",
@@ -526,6 +635,11 @@ class TestLiteLLMProvider(unittest.TestCase):
         ]["llm_provider_tips.moonshot"]
         self.assertIn("推荐理由：", zh_kimi_tips)
         self.assertIn("视频创作链路匹配", zh_kimi_tips)
+        self.assertIn("活动截至 2026 年 12 月 31 日", zh_kimi_tips)
+        en_kimi_tips = json.loads((i18n_dir / "en.json").read_text(encoding="utf-8"))[
+            "Translation"
+        ]["llm_provider_tips.moonshot"]
+        self.assertIn("offer ends December 31, 2026", en_kimi_tips)
 
     def test_required_api_key_providers_have_clickable_entry_points(self):
         """需要密钥的 Provider 必须提供统一申请入口，避免 WebUI 只给出文字。"""
@@ -1142,6 +1256,47 @@ class TestLiteLLMProvider(unittest.TestCase):
         self.assertIn("returned empty choices", result)
         self.assertNotIn("NoneType", result)
 
+    def test_qwen_concurrent_snapshots_keep_their_own_api_keys(self):
+        class FakeGenerationResponse(dict):
+            status_code = 200
+
+        barrier = Barrier(2, timeout=5)
+        calls = {}
+        fake_dashscope = types.SimpleNamespace(api_key="unrelated-global-key")
+
+        def call(**kwargs):
+            barrier.wait()
+            prompt = kwargs["messages"][0]["content"]
+            calls[prompt] = kwargs.get("api_key")
+            return FakeGenerationResponse({"output": {"text": prompt}})
+
+        fake_dashscope.Generation = types.SimpleNamespace(call=call)
+        modules = {
+            "dashscope": fake_dashscope,
+            "dashscope.api_entities": types.SimpleNamespace(),
+            "dashscope.api_entities.dashscope_response": types.SimpleNamespace(
+                GenerationResponse=FakeGenerationResponse
+            ),
+        }
+        with patch.dict(sys.modules, modules), ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(
+                llm._generate_response,
+                "first prompt",
+                {"llm_provider": "qwen", "qwen_api_key": "first-key"},
+            )
+            second = pool.submit(
+                llm._generate_response,
+                "second prompt",
+                {"llm_provider": "qwen", "qwen_api_key": "second-key"},
+            )
+            self.assertEqual(first.result(), "first prompt")
+            self.assertEqual(second.result(), "second prompt")
+
+        self.assertEqual(
+            calls, {"first prompt": "first-key", "second prompt": "second-key"}
+        )
+        self.assertEqual(fake_dashscope.api_key, "unrelated-global-key")
+
     def test_apimart_provider_uses_unwrapped_openai_compatible_endpoint(self):
         """
         APIMart 文档同时展示 `/api/v1` 和 `/v1` 两组入口。前者的示例响应
@@ -1305,6 +1460,55 @@ class TestLiteLLMProvider(unittest.TestCase):
         )
         self.assertEqual(result, "hello\nevolink")
 
+    def test_iflytek_provider_uses_openai_compatible_client(self):
+        """
+        iFlytek Astron MaaS serves Spark over OpenAI-compatible Chat Completions.
+        Pay-as-you-go is the default; a Token Plan base URL saved by the user
+        must be used as-is because keys from one plan do not work on the other.
+        """
+        config.app["llm_provider"] = "iflytek"
+        config.app["iflytek_api_key"] = "iflytek-key"
+        config.app["iflytek_model_name"] = ""
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                self.kwargs = kwargs
+                message = types.SimpleNamespace(content="hello\niflytek")
+                choice = types.SimpleNamespace(message=message)
+                return types.SimpleNamespace(choices=[choice])
+
+        for configured_base_url, expected_base_url in (
+            ("", "https://maas-api.cn-huabei-1.xf-yun.com/v2"),
+            (
+                "https://maas-token-api.cn-huabei-1.xf-yun.com/v2",
+                "https://maas-token-api.cn-huabei-1.xf-yun.com/v2",
+            ),
+        ):
+            with self.subTest(base_url=configured_base_url):
+                config.app["iflytek_base_url"] = configured_base_url
+                fake_completions = FakeCompletions()
+                fake_client = types.SimpleNamespace(
+                    chat=types.SimpleNamespace(completions=fake_completions)
+                )
+
+                with (
+                    patch.object(llm, "OpenAI", return_value=fake_client) as openai_client,
+                    patch.object(llm, "ChatCompletion", types.SimpleNamespace),
+                ):
+                    result = llm._generate_response("Say hello")
+
+                openai_client.assert_called_once_with(
+                    api_key="iflytek-key",
+                    base_url=expected_base_url,
+                )
+                self.assertEqual(
+                    fake_completions.kwargs,
+                    {
+                        "model": "spark-x2.5",
+                        "messages": [{"role": "user", "content": "Say hello"}],
+                    },
+                )
+                self.assertEqual(result, "hello\niflytek")
     def test_openrouter_provider_uses_openai_compatible_client(self):
         """
         OpenRouter exposes OpenAI-compatible Chat Completions through one
@@ -1739,6 +1943,25 @@ class TestClaudeCodeProvider(unittest.TestCase):
             command[command.index("--system-prompt") + 1],
             llm.CLAUDE_CODE_SYSTEM_PROMPT,
         )
+
+    def test_prompt_is_sent_through_stdin_not_argv(self):
+        """Windows 上 npm 安装的 claude 是 claude.cmd，cmd.exe 会在第一个换行处截断
+        参数，多行 prompt 及其后的隔离参数都会丢失，因此 prompt 必须走 stdin。"""
+        prompt = "# Role: Generator\n\n## Goals:\nwrite something"
+        with (
+            patch.object(llm.shutil, "which", return_value="/usr/bin/claude"),
+            patch.object(
+                llm.subprocess,
+                "run",
+                return_value=self._completed(stdout=self._cli_payload("ok")),
+            ) as run,
+        ):
+            llm._generate_response(prompt)
+
+        command = run.call_args.args[0]
+        self.assertFalse(any("\n" in arg for arg in command))
+        self.assertNotIn(prompt, command)
+        self.assertEqual(run.call_args.kwargs["input"], prompt)
 
     def test_model_name_is_only_passed_when_configured(self):
         """模型名留空时应沿用 CLI 默认模型，而不是硬编码一个可能失效的 ID。"""

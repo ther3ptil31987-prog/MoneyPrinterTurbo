@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import requests
 
 from app.config import config
 from app.services import voice
@@ -29,6 +30,10 @@ class _FakeSegment:
 
 def _sse_event(event_type, **payload):
     return f"data: {json.dumps({'type': event_type, **payload})}"
+
+
+def _sse_content(lines):
+    return ["\n".join(lines).encode("utf-8")]
 
 
 def _sse_lines(*events):
@@ -83,11 +88,11 @@ def test_voxcpm_tts_assembles_sse_wav_and_converts_to_mp3(
     response = SimpleNamespace(
         status_code=200,
         text="",
-        iter_lines=lambda decode_unicode: _sse_lines(
+        iter_content=lambda chunk_size: _sse_content(_sse_lines(
             _sse_event("speech.audio.delta", audio=base64.b64encode(audio_chunks[0]).decode()),
             _sse_event("speech.audio.delta", audio=base64.b64encode(audio_chunks[1]).decode()),
             _sse_event("speech.audio.done", usage={"total_tokens": 1}),
-        ),
+        )),
         close=Mock(),
     )
     post = Mock(return_value=response)
@@ -262,7 +267,7 @@ def test_voxcpm_tts_failure_never_overwrites_existing_audio(
     response = SimpleNamespace(
         status_code=200,
         text="",
-        iter_lines=lambda decode_unicode: events,
+        iter_content=lambda chunk_size: _sse_content(events),
         close=lambda: None,
     )
     post = Mock(return_value=response)
@@ -303,6 +308,57 @@ def test_voxcpm_http_error_is_retried_and_preserves_output(
 
     assert voice.voxcpm_tts("Hello", "default", str(output)) is None
     assert output.read_bytes() == b"previous-audio"
+    assert post.call_count == 3
+    assert sleep.call_args_list == [((1.0,),), ((2.0,),)]
+
+
+@pytest.mark.parametrize("failure_stage", ["post", "stream"])
+def test_voxcpm_does_not_repeat_speech_after_ambiguous_transport_failure(
+    monkeypatch, tmp_path, voxcpm_config, failure_stage
+):
+    """A dropped POST response or SSE stream can follow a completed generation."""
+
+    def interrupted_stream(**_kwargs):
+        yield (_sse_event(
+            "speech.audio.delta", audio=base64.b64encode(b"partial").decode()
+        ) + "\n\n").encode("utf-8")
+        raise requests.ReadTimeout("stream dropped")
+
+    response = SimpleNamespace(
+        status_code=200,
+        text="",
+        iter_content=interrupted_stream,
+        close=Mock(),
+    )
+    post = Mock(
+        side_effect=requests.ReadTimeout("response lost")
+        if failure_stage == "post"
+        else None,
+        return_value=response,
+    )
+    monkeypatch.setattr(voice.requests, "post", post)
+    sleep = Mock()
+    monkeypatch.setattr(voice.time, "sleep", sleep)
+    output = tmp_path / "existing.mp3"
+    output.write_bytes(b"previous-audio")
+
+    assert voice.voxcpm_tts("Hello", "default", str(output)) is None
+    assert output.read_bytes() == b"previous-audio"
+    post.assert_called_once()
+    sleep.assert_not_called()
+    if failure_stage == "stream":
+        response.close.assert_called_once()
+
+
+def test_voxcpm_retries_before_connection_is_established(
+    monkeypatch, tmp_path, voxcpm_config
+):
+    post = Mock(side_effect=requests.ConnectTimeout("could not connect"))
+    monkeypatch.setattr(voice.requests, "post", post)
+    sleep = Mock()
+    monkeypatch.setattr(voice.time, "sleep", sleep)
+
+    assert voice.voxcpm_tts("Hello", "default", str(tmp_path / "voice.mp3")) is None
     assert post.call_count == 3
     assert sleep.call_args_list == [((1.0,),), ((2.0,),)]
 
