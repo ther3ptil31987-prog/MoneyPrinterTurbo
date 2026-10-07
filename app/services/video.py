@@ -1,4 +1,5 @@
 import itertools
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 import io
 import math
@@ -27,7 +28,7 @@ from moviepy import (
     afx,
 )
 from moviepy.video.tools.subtitles import SubtitlesClip
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageColor, ImageDraw, ImageFont, ImageOps
 
 from app.config import config
 from app.models import const
@@ -710,8 +711,11 @@ def concat_video_clips_with_ffmpeg(
 def _sanitize_image_file(image_path: str) -> str:
     # 某些本地图片虽然能被 Pillow 打开，但会因为损坏的 EXIF/eXIf 元数据导致
     # ImageClip 在解析阶段直接抛异常。这里重新导出一份“干净图片”，把坏元数据剥离掉。
-    image_root, _ = os.path.splitext(image_path)
-    sanitized_path = f"{image_root}.sanitized.png"
+    # Bound the intermediate basename while retaining complete source identity.
+    # Different extensions must not overwrite pixels, and valid long filenames
+    # must not exceed the filesystem's component limit after adding a suffix.
+    source_identity = hashlib.sha256(os.fsencode(os.path.abspath(image_path))).hexdigest()
+    sanitized_path = os.path.join(os.path.dirname(image_path), f"{source_identity}.sanitized.png")
 
     temp_path = ""
     try:
@@ -1450,6 +1454,25 @@ def _get_visible_center_position(
     return x, y
 
 
+def validate_subtitle_colors(params: VideoParams) -> None:
+    """Reject colors Pillow cannot render, before generation services run."""
+    if not params.subtitle_enabled:
+        return
+    colors = [("text_fore_color", params.text_fore_color)]
+    # Rendering truncates the width to an integer; a zero-width stroke is unused.
+    if int(params.stroke_width) > 0:
+        colors.append(("stroke_color", params.stroke_color))
+    if isinstance(params.text_background_color, str):
+        colors.append(("text_background_color", params.text_background_color))
+    for field, value in colors:
+        if value is None:
+            continue
+        try:
+            ImageColor.getcolor(value, "RGBA")
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"invalid subtitle color: {field}") from exc
+
+
 def subtitle_colors_are_indistinguishable(params: VideoParams) -> bool:
     """判断字幕文字和背景是否同色，提醒用户可能无法看清字幕。"""
     if not params.subtitle_enabled or not params.text_background_color:
@@ -1738,7 +1761,7 @@ def generate_video(
         voice_source_clip = clip_stack.enter_context(AudioFileClip(audio_path))
         video_clip = source_video_clip
         audio_clip = voice_source_clip.with_effects(
-            [afx.MultiplyVolume(params.voice_volume)]
+            [afx.MultiplyVolume(1.0 if params.voice_volume is None else params.voice_volume)]
         )
 
         def make_textclip(text):
@@ -1789,15 +1812,14 @@ def generate_video(
         bgm_mix_succeeded = True
         if bgm_file:
             try:
-                bgm_effects = [
-                    afx.MultiplyVolume(params.bgm_volume),
-                    afx.AudioFadeOut(3),
-                ]
+                bgm_effects = [afx.MultiplyVolume(params.bgm_volume)]
                 # 服务内解析的随机/自定义音乐可能比成片短，需要循环铺满；任务层
                 # 通过 override 传入的文件表示提供商已经完成时长适配。这里依据
                 # 文件来源决定是否循环，避免今后每增加一个提供商都修改名称白名单。
                 if bgm_file_override is None:
                     bgm_effects.append(afx.AudioLoop(duration=video_clip.duration))
+                # Fade the complete playback timeline, not each source loop.
+                bgm_effects.append(afx.AudioFadeOut(3))
                 bgm_source_clip = clip_stack.enter_context(AudioFileClip(bgm_file))
                 bgm_clip = bgm_source_clip.with_effects(bgm_effects)
                 audio_clip = CompositeAudioClip([audio_clip, bgm_clip])
@@ -1861,7 +1883,11 @@ def render_image_zoom_video(image_path: str, clip_duration: int = 5) -> str:
             # The duration changes the rendered content, so it must be part of
             # the output identity. Different tasks may render the same image
             # concurrently; only publish a complete MP4 after MoviePy closes it.
-            video_file = f"{image_path}.zoom-{clip_duration}.mp4"
+            source_identity = hashlib.sha256(os.fsencode(os.path.abspath(image_path))).hexdigest()
+            duration_identity = hashlib.sha256(str(clip_duration).encode()).hexdigest()[:16]
+            video_file = os.path.join(
+                os.path.dirname(image_path), f"{source_identity}.zoom-{duration_identity}.mp4"
+            )
             descriptor, temp_path = tempfile.mkstemp(
                 prefix=".image-zoom-",
                 suffix=".mp4",
