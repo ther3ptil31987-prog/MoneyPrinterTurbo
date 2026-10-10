@@ -3587,6 +3587,16 @@ def _render_settings_dialog():
                     ),
                 )
 
+            if llm_provider == "kimi_code" and middle_config_panel.open:
+                from app.services import kimi_code_oauth
+                from webui.kimi_login import render_kimi_login
+
+                # 给嵌套 fragment 独立的容器，轮询重绘不占用后续控件的位置。
+                with llm_form_panel.container():
+                    render_kimi_login(
+                        kimi_code_oauth.resolve_region(st_llm_base_url), tr
+                    )
+
             if llm_form_panel.button(
                 tr("Test LLM Connection"),
                 key="test_llm_connection_button",
