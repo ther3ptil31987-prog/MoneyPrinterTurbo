@@ -117,10 +117,13 @@ def mktimestamp(time_unit: float) -> str:
     还需要这个格式化函数来兼容 Azure v2、Gemini、SiliconFlow 这些
     手工构造的字幕时间轴，因此这里内置一个等价实现。
     """
-    hour = math.floor(time_unit / 10**7 / 3600)
-    minute = math.floor((time_unit / 10**7 / 60) % 60)
-    seconds = (time_unit / 10**7) % 60
-    return f"{hour:02d}:{minute:02d}:{seconds:06.3f}"
+    # 先统一取整到毫秒再拆分时分秒。直接用 `:06.3f` 格式化取模后的秒数，
+    # 59.9996 秒会显示成 `00:00:60.000`，严格的 SRT 解析器会拒绝该时间戳。
+    total_milliseconds = int(round(time_unit / 10**4))
+    hour, remainder = divmod(total_milliseconds, 3_600_000)
+    minute, remainder = divmod(remainder, 60_000)
+    seconds, milliseconds = divmod(remainder, 1000)
+    return f"{hour:02d}:{minute:02d}:{seconds:02d}.{milliseconds:03d}"
 
 
 def get_siliconflow_voices() -> list[str]:
@@ -1256,7 +1259,10 @@ def populate_legacy_submaker_with_full_text(
     sub_maker.subs = []
     sub_maker.offset = []
 
-    normalized_text = (text or "").strip()
+    # 与 create_subtitle() 使用同一套脚本清理：`---`、`***` 这类 Markdown
+    # 分隔行不会被朗读，若参与按字符比例分配，会占用一段音频时长，导致
+    # 后续字幕提前出现，或最后一句字幕在音频结束前就消失。
+    normalized_text = utils.normalize_script_for_subtitle_matching(text or "").strip()
     if not normalized_text:
         return sub_maker
 
@@ -1624,11 +1630,15 @@ def siliconflow_tts(
         logger.error("SiliconFlow API key is not set")
         return None
 
-    # 将voice_volume转换为硅基流动的增益范围
-    # 默认voice_volume为1.0，对应gain为0
-    gain = voice_volume - 1.0
-    # 确保gain在[-10, 10]范围内
-    gain = max(-10, min(10, gain))
+    # voice_volume 是线性倍数，硅基流动的 gain 单位是 dB，范围 [-10, 10]。
+    # 默认 1.0 对应 0 dB；2.0 约为 +6 dB，0.6 约为 -4.4 dB。直接相减会把
+    # 2 倍音量当作 +1 dB，试听音量与最终视频的线性混音结果明显不一致。
+    if voice_volume is None:
+        voice_volume = 1.0
+    if voice_volume <= 0:
+        gain = -10.0
+    else:
+        gain = max(-10.0, min(10.0, 20.0 * math.log10(voice_volume)))
 
     url = "https://api.siliconflow.cn/v1/audio/speech"
 
@@ -3690,7 +3700,14 @@ def create_subtitle(
                 _write_subtitle_items(sub_items, subtitle_file)
                 return
 
-        script_lines = utils.split_string_by_punctuations(text)
+        # 只有符号的行（如 `* * *`、`———`、`• • •` 场景分隔）不会被朗读，
+        # 也不会得到任何词级时间轴；保留它们会让行数永远对不上，整段字幕
+        # 都无法生成。
+        script_lines = [
+            line
+            for line in utils.split_string_by_punctuations(text)
+            if re.sub(r"[_\W]+", "", line)
+        ]
         if hasattr(sub_maker, "cues") and sub_maker.cues:
             sub_items = _build_subtitle_items_from_edge_cues(sub_maker, script_lines)
         else:

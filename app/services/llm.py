@@ -43,8 +43,9 @@ _CONNECTION_FAILURE_MARKERS = (
 )
 _THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
 _UNCLOSED_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*$", re.IGNORECASE | re.DOTALL)
+_UNOPENED_THINK_BLOCK_RE = re.compile(r"^.*</think\s*>", re.IGNORECASE | re.DOTALL)
 _URL_USERINFO_RE = re.compile(
-    r"((?:https?|wss?)://)([^/\s?#@]*:[^/\s?#@]*@)", re.IGNORECASE
+    r"((?:https?|wss?)://)([^/\s?#@]+@)", re.IGNORECASE
 )
 _SENSITIVE_QUERY_RE = re.compile(
     r"([?&](?:api[_-]?key|access[_-]?token|token|key|secret|password)=)([^&#\s]+)",
@@ -194,6 +195,10 @@ def _normalize_text_response(content, llm_provider: str) -> str:
     # `<think>...</think>` 中返回。视频脚本和关键词只需要最终可朗读文本，
     # 如果不在服务层统一清理，WebUI、字幕和配音都会把思考过程当正文处理。
     content = _THINK_BLOCK_RE.sub("", content)
+    # DeepSeek R1、QwQ 等模型的对话模板会把起始 `<think>` 放进提示词，
+    # vLLM/Ollama 等网关返回的正文只剩 `推理...</think>答案`。成对清理之后
+    # 仍残留的闭合标签之前都是推理内容，也不能进入脚本。
+    content = _UNOPENED_THINK_BLOCK_RE.sub("", content)
     content = _UNCLOSED_THINK_BLOCK_RE.sub("", content).strip()
     if not content:
         raise ValueError(f"[{llm_provider}] returned empty text content")
@@ -1325,8 +1330,8 @@ def _fallback_social_metadata(
 
     title = subject
     if not title and script:
-        # 没有主题时，用脚本第一句兜底生成 title，避免接口返回空标题。
-        title = re.split(r"(?<=[.!?。！？])\s+", script)[0]
+        # 中日文句末通常没有空格；英文仍要求空白，避免拆开 2.0 等数字。
+        title = re.split(r"(?<=[.!?])\s+|(?<=[。！？])\s*", script, maxsplit=1)[0]
 
     return {
         "title": _clamp_text(title, spec["title_max"]),
