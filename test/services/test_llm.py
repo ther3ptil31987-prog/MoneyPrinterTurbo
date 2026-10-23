@@ -675,6 +675,7 @@ class TestLiteLLMProvider(unittest.TestCase):
                 "minimax",
                 "mimo",
                 "iflytek",
+                "infistar",
                 "shengsuanyun",
                 "apimart",
                 "cloudflare",
@@ -2613,6 +2614,11 @@ class TestSocialMetadata(unittest.TestCase):
         )
 
         self.assertEqual(tags, ["#上海旅行", "#việtnam", "#badchars"])
+
+    def test_normalize_hashtags_keeps_combining_marks(self):
+        tags = llm._normalize_hashtags(["#भारत", "#বাংলা", "#தமிழ்", "#ท่องเที่ยว"], count=5)
+
+        self.assertEqual(tags, ["#भारत", "#বাংলা", "#தமிழ்", "#ท่องเที่ยว"])
 
     def test_parse_social_metadata_recovers_embedded_json(self):
         raw = 'Sure: {"title":"T","caption":"C","hashtags":["#x"]} thanks'
