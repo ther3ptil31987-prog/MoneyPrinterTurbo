@@ -145,7 +145,7 @@ VIDEO_SOURCE_GROUPS = {
         "wavespeed",
         "muapi",
     ),
-    "ai_image": ("openai_image",),
+    "ai_image": ("openai_image", "codex_image"),
     "local": ("local",),
 }
 # Upload-Post 的 API Key 与发布用户分别在两个页面管理，并且发布用户名称
@@ -2125,6 +2125,14 @@ def _render_generation_task_snapshot(task_id, task):
     video_files = task.get("videos") or []
     if state == const.TASK_STATE_FAILED:
         error = str(task.get("error") or "").strip()
+        error_key = task.get("error_key")
+        error_params = task.get("error_params") or {}
+        if (
+            isinstance(error_key, str)
+            and error_key.startswith("codex.")
+            and isinstance(error_params, Mapping)
+        ):
+            error = tr(error_key).format(**error_params)
         message = tr("Video Generation Failed")
         st.error(f"{message}: {error}" if error else message)
         activity = task.get("generation_activity") or {}
@@ -2344,18 +2352,23 @@ def get_llm_provider_tips(provider_id, **kwargs):
 def format_llm_connection_error(provider_id, base_url, error):
     """为可明确定位的鉴权错误补充配置检查建议，同时保留原始响应。"""
     error_text = str(error or "").strip()
-    if provider_id == "openai_codex":
-        from app.services.codex_oauth import ERROR_MESSAGES
+    if provider_id in {"openai_codex", "openai_chatgpt"}:
+        if provider_id == "openai_chatgpt":
+            from app.services.chatgpt_oauth import ERROR_MESSAGES
+            message_prefix = "chatgpt.oauth"
+        else:
+            from app.services.codex_oauth import ERROR_MESSAGES
+            message_prefix = "codex.oauth"
 
         for key, message in ERROR_MESSAGES.items():
             if error_text == message:
-                return tr(f"codex.oauth.{key}")
+                return tr(f"{message_prefix}.{key}")
         status_match = re.fullmatch(
-            r"OpenAI - Codex returned HTTP (\d+)\. Check the selected model and your account access\.",
+            r"OpenAI - (?:Codex|ChatGPT \(Native OAuth\)) returned HTTP (\d+)\. Check the selected model and your account access\.",
             error_text,
         )
         if status_match:
-            return tr("codex.oauth.http_error").format(status=status_match[1])
+            return tr(f"{message_prefix}.http_error").format(status=status_match[1])
     normalized_error = error_text.lower()
     authentication_markers = (
         "401",
@@ -3657,6 +3670,17 @@ def _render_settings_dialog():
 
                 with llm_form_panel:
                     st_llm_model_name = render_codex_model_selector(llm_model_name, tr)
+            elif llm_provider == "openai_chatgpt":
+                from webui.chatgpt_login import render_chatgpt_login
+                from webui.chatgpt_models import render_chatgpt_model_selector
+
+                with llm_form_panel:
+                    if middle_config_panel.open:
+                        # Keep the nested polling fragment's delta paths separate
+                        # from the model selector and connection-test controls.
+                        with st.container(key="chatgpt_login_panel"):
+                            render_chatgpt_login(tr)
+                    st_llm_model_name = render_chatgpt_model_selector(llm_model_name, tr)
             elif llm_provider == "groq":
                 effective_api_key = st_llm_api_key or llm_api_key
                 effective_base_url = st_llm_base_url or llm_base_url
@@ -4200,6 +4224,30 @@ def _render_settings_dialog():
             with st.container(border=True):
                 st.markdown(f"#### {tr('AI Image Generation APIs')}")
                 st.caption(tr("AI Image Generation APIs Help"))
+                st.markdown(f"**{tr('codex.image.label')}**")
+                st.caption(tr("codex.image.help"))
+                from webui.codex_models import render_codex_model_selector
+
+                codex_image_model = render_codex_model_selector(
+                    str(config.app.get("codex_image_model_name", "") or ""),
+                    tr,
+                    prefix="codex_image",
+                )
+                _set_runtime_config("app", "codex_image_model_name", codex_image_model)
+                codex_image_timeout = st.text_input(
+                    tr("codex.image.timeout"),
+                    value=str(config.app.get("codex_image_timeout") or "300"),
+                    placeholder="300",
+                    key="codex_image_timeout_input",
+                )
+                _set_runtime_config(
+                    "app", "codex_image_timeout", codex_image_timeout.strip()
+                )
+                if right_config_panel.open:
+                    from webui.codex_login import render_codex_login
+
+                    with st.container():
+                        render_codex_login(tr)
                 st.markdown(f"**{tr('OpenAI Compatible Text-to-Image')}**")
 
                 openai_image_base_url = st.text_input(
@@ -5383,6 +5431,7 @@ def _render_video_settings(panel, params):
                 "muapi": tr("MuAPI AI Video"),
                 "loomloom": tr("Shengsuan Cloud AI Video"),
                 "openai_image": tr("OpenAI Compatible Text-to-Image"),
+                "codex_image": tr("codex.image.label"),
                 "local": tr("Local file"),
             }
             saved_video_source_name = str(
@@ -5575,7 +5624,7 @@ def _render_video_settings(panel, params):
                 "ui", "video_fit_mode", params.video_fit_mode.value
             )
 
-            if params.video_source in {"local", "openai_image"}:
+            if params.video_source in {"local", "openai_image", "codex_image"}:
                 image_motion_labels = {
                     ImageMotion.static.value: tr("Static Image"),
                     ImageMotion.zoom.value: tr("Slow Zoom"),
@@ -8348,6 +8397,7 @@ def _render_generation_controls(
             "muapi",
             "loomloom",
             "openai_image",
+            "codex_image",
             "local",
         ]:
             _remove_active_generation_task(task_id)
@@ -8474,6 +8524,18 @@ def _render_generation_controls(
             _remove_active_generation_task(task_id)
             st.error(tr("Confirm MuAPI Charge Required"))
             st.stop()
+
+        if params.video_source == "codex_image":
+            from app.services import codex_image, codex_oauth
+
+            try:
+                codex_image.capture_context(
+                    config.snapshot_config_with_pending(config.app)
+                )
+            except codex_oauth.CodexError as error:
+                _remove_active_generation_task(task_id)
+                st.error(tr(error.key).format(**error.params))
+                st.stop()
 
         if params.video_source == "openai_image" and not material.is_openai_image_enabled(
             config.snapshot_config_with_pending(config.app)
