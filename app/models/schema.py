@@ -3,7 +3,14 @@ from enum import Enum
 from typing import Annotated, Any, List, Literal, Optional, Union
 
 import pydantic
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictBool
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    StrictBool,
+)
 
 from app.config import config
 
@@ -185,8 +192,21 @@ RequestVoiceName = Annotated[
 ]
 
 
+def _reject_blank_request_script(value: str) -> str:
+    if not value.strip():
+        raise ValueError("cannot be blank")
+    return value
+
+
+# The script of /audio and /subtitle requests. These endpoints narrate a script
+# the client sends and have no video_subject to write one from, so an empty or
+# whitespace-only script was queued and then failed the task with
+# "'AudioRequest' object has no attribute 'video_subject'".
+RequestScript = Annotated[str, AfterValidator(_reject_blank_request_script)]
+
+
 class SubtitleRequest(BaseModel):
-    video_script: str
+    video_script: RequestScript
     video_language: Optional[str] = ""
     voice_name: RequestVoiceName = DEFAULT_REQUEST_VOICE_NAME
     voice_volume: Optional[float] = Field(default=1.0, allow_inf_nan=False)
@@ -213,7 +233,7 @@ class SubtitleRequest(BaseModel):
 
 
 class AudioRequest(BaseModel):
-    video_script: str
+    video_script: RequestScript
     video_language: Optional[str] = ""
     voice_name: RequestVoiceName = DEFAULT_REQUEST_VOICE_NAME
     voice_volume: Optional[float] = Field(default=1.0, allow_inf_nan=False)
@@ -292,6 +312,13 @@ class TaskVideoRequest(VideoParams, BaseModel):
     # /subtitle. Edge TTS accepts no empty voice, so with the empty default
     # of VideoParams the task failed at the audio stage, after the LLM calls.
     voice_name: RequestVoiceName = DEFAULT_REQUEST_VOICE_NAME
+
+    # Every /videos task renders, and the render reads the frame size from the
+    # aspect ratio. A null one was accepted here and failed the task with
+    # "None is not a valid VideoAspect" after the script and narration steps.
+    # VideoParams keeps the field optional for the CLI, which rejects a null
+    # in its own preflight, and for stored tasks.
+    video_aspect: VideoAspect = VideoAspect.portrait
 
 
 class TaskQueryRequest(BaseModel):
